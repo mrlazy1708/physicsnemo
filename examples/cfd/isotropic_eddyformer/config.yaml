@@ -1,0 +1,23 @@
+model:
+  idim: 3
+  odim: 3
+  hdim: 32
+  num_layers: 4
+  layer_config:
+    basis: legendre
+    mesh: [8, 8, 8]
+    mode: [10, 10, 10]
+    mode_les: [5, 5, 5]
+    kernel_size: [2, 2, 2]
+    kernel_size_les: [2, 2, 2]
+    ffn_dim: 128
+    activation: GELU
+    num_heads: 4
+    heads_dim: 32
+
+training:
+  dataset: data/ns3d-re94
+  t: 0.5
+  batch_size: 4
+  num_epochs: 100
+  learning_rate: 1e-3
