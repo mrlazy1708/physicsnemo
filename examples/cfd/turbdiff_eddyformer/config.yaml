@@ -1,0 +1,28 @@
+model:
+  idim: 5
+  odim: 4
+  hdim: 32
+  num_layers: 4
+  use_scale: true
+  layer_config:
+    basis: leg_elem
+    mesh: [16, 4, 4]
+    mode: [13, 13, 13]
+    mode_les: [5, 5, 5]
+    kernel_size: [2, 2, 2]
+    kernel_size_les: [2, 2, 2]
+    ffn_dim: 128
+    activation: GELU
+    num_heads: 4
+    heads_dim: 32
+
+training:
+  dataset: /global/cfs/cdirs/m5024/yj/shapes_npy
+  result_dir: outputs/shapes/ef-leg
+  amp: false
+  compile: true
+  batch_size: 4
+  num_epochs: 100
+  learning_rate: 1e-3
+  test_every: 100
+  ckpt_every: 1000

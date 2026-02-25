@@ -80,7 +80,14 @@ class EddyFormerConfig(Module):
 
 class EddyFormerLayer(Module):
 
-    def __init__(self, hdim: int, cfg: EddyFormerConfig, *, layer_scale: float = 1e-7):
+    def __init__(
+        self,
+        hdim: int,
+        cfg: EddyFormerConfig,
+        *,
+        cond_dim: int | None = None,
+        layer_scale: float = 1e-7,
+    ):
         """
         EddyFormer layer.
         """
@@ -96,7 +103,14 @@ class EddyFormerLayer(Module):
         self.sem_conv_les = cfg.conv("les")(hdim, hdim)
         self.sem_attn = cfg.attn(hdim, hdim, conv=cfg.conv("les"))
 
-    def __call__(self, les: SEM, sgs: SEM) -> Tuple[SEM, SEM]:
+        # Optional FiLM-style conditioning: project conditioning vector -> (w, b)
+        # (scalar w,b per layer, broadcast over all features)
+        self.cond_dim = cond_dim
+        self.project_onto_wb = (
+            nn.Linear(cond_dim, 2) if (cond_dim is not None and cond_dim > 0) else None
+        )
+
+    def __call__(self, les: SEM, sgs: SEM, c: Tensor | None = None) -> Tuple[SEM, SEM]:
         """
         """
         les.nodal = les.nodal + self.sem_attn(les).nodal
@@ -104,6 +118,16 @@ class EddyFormerLayer(Module):
 
         sgs.nodal = sgs.nodal + self.eps * les.to(self.mode).nodal
         sgs.nodal = sgs.nodal + self.ffn_sgs(self.sem_conv_sgs(sgs).nodal)
+        
+        # Conditioning injection (FiLM): w*features + b, applied to both LES and SGS.
+        if self.project_onto_wb is not None and c is not None:
+            wb = self.project_onto_wb(c)  # (2,)
+            w, b = wb[0], wb[1]
+            # broadcast to nodal shape
+            w = w.reshape((1,) * les.nodal.ndim)
+            b = b.reshape((1,) * les.nodal.ndim)
+            les.nodal = les.nodal * (1.0 + w) + b
+            sgs.nodal = sgs.nodal * (1.0 + w) + b
 
         return les, sgs
 
@@ -145,8 +169,9 @@ class EddyFormer(Module):
                  hdim: int,
                  num_layers: int,
                  *,
-                 use_scale: bool = True,
-                 cfg: EddyFormerConfig):
+                 use_scale: bool = False,
+                 cfg: EddyFormerConfig,
+                 cond_dim: int | None = None):
         """
         EddyFormer model.
         """
@@ -160,7 +185,7 @@ class EddyFormer(Module):
 
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
-            layer = EddyFormerLayer(hdim, cfg)
+            layer = EddyFormerLayer(hdim, cfg, cond_dim=cond_dim)
             self.layers.append(layer)
 
         self.proj_les = cfg.ffn(hdim, out_features=odim)
@@ -168,21 +193,32 @@ class EddyFormer(Module):
 
         self.scale = nn.Parameter(torch.zeros(odim)) if use_scale else None
 
-    def __call__(self, input: Union[SEM, Tensor], return_sem: bool = False) -> Union[SEM, Tensor]:
+    def __call__(
+        self,
+        input: Union[SEM, Tensor],
+        c: Tensor | None = None,
+        return_sem: bool = False,
+    ) -> Union[SEM, Tensor]:
         """
         """
         if isinstance(input, Tensor):
             size = 2 * torch.pi * torch.ones(self.ndim, device=input.device)
             ϕ = SEM(self.cfg.basis, size, self.cfg.mesh, self.cfg.mode) \
                .from_grid(input, "lag8") # default interpolation method
+            # print(input.shape)
+            # def l2(x, y): return torch.linalg.norm(x - y) / torch.linalg.norm(y)
+            # print(l2(ϕ.eval(input.shape[:-1]), input))
+
+            # import code; code.interact(local=dict(globals(), **locals()))
         else:
             ϕ = input
 
-        x = ϕ.grid.to(ϕ.nodal)
-        for n, mesh in enumerate(ϕ.mesh):
-          x = x.unsqueeze(dim:=self.ndim + n)
-          x = torch.repeat_interleave(x, mesh, dim)
-        x = torch.concatenate(torch.broadcast_tensors(ϕ.nodal, x), dim=-1)
+        # x = ϕ.grid.to(ϕ.nodal)
+        # for n, mesh in enumerate(ϕ.mesh):
+        #   x = x.unsqueeze(dim:=self.ndim + n)
+        #   x = torch.repeat_interleave(x, mesh, dim)
+        #  print(x.shape, ϕ.nodal.shape)
+        x = torch.concatenate([ϕ.nodal, ϕ.coords], dim=-1)
 
         sgs = ϕ.new(x)
         les = sgs.to(self.cfg.mode_les)
@@ -191,7 +227,8 @@ class EddyFormer(Module):
         les.nodal = self.lift_les(les.nodal)
 
         for layer in self.layers:
-            les, sgs = layer(les, sgs)
+            les, sgs = layer(les, sgs, c)
+            
 
         sgs.nodal = self.proj_sgs(sgs.nodal)
         les.nodal = self.proj_les(les.nodal)
