@@ -14,6 +14,9 @@ from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel
 
+import wandb
+from omegaconf import OmegaConf
+
 from physicsnemo.models.eddyformer import EddyFormer, EddyFormerConfig
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.utils import StaticCaptureTraining, StaticCaptureEvaluateNoGrad
@@ -54,8 +57,10 @@ class TurbDiff(Dataset):
 
         sample = (torch.from_numpy(data.item()["data_3d"][time_idx]) - mean) / std
         if test:
+
             mask = torch.from_numpy(data.item()["inside_mask"])[..., None]
             sample = torch.concat([sample, mask], dim=-1)
+            print(sample.shape)
 
         return sample
 
@@ -83,6 +88,17 @@ def shapes_trainer(cfg: DictConfig) -> None:
     os.makedirs(cfg.training.result_dir, exist_ok=True)
     log.file_logging(f"{cfg.training.result_dir}/log.txt")
     LaunchLogger.initialize()  # PhysicsNeMo launch logger
+    
+    if dist.rank == 0:
+        # init wandb
+        wandb.init(
+            project="physicsnemo",
+            name=f"shapes_ef_{cfg.training.result_dir}",
+            group=f"shapes_ef",
+            config=OmegaConf.to_container(cfg, resolve=True),
+            mode="online",
+            # resume="must",
+        )
 
     # define model and optimizer
     model = EddyFormer(
@@ -116,7 +132,7 @@ def shapes_trainer(cfg: DictConfig) -> None:
                 find_unused_parameters=dist.find_unused_parameters,
             )
         torch.cuda.current_stream().wait_stream(ddps)
-        log.success("Initialized DDP training")
+        log.success("Initialized DDP training with number of processes: {dist.world_size}")
 
     optimizer = Adam(model.parameters(), lr=cfg.training.learning_rate)
 
@@ -126,7 +142,7 @@ def shapes_trainer(cfg: DictConfig) -> None:
 
     testset = TurbDiff(root=cfg.training.dataset, split="test")
     testloader = DataLoader(testset, batch_size=None)
-
+     
     # define training step
     @StaticCaptureTraining(
         model=model,
@@ -158,14 +174,16 @@ def shapes_trainer(cfg: DictConfig) -> None:
     log.info("Training started")
 
     for epoch in range(cfg.training.num_epochs):
-        for it, (input, target) in enumerate(dataloader, it):
+        for it, (input, target) in tqdm(enumerate(dataloader), desc="Training", total=len(dataloader), leave=False, unit="batch"):
 
             input = input.to(dist.device)
             target = target.to(dist.device)
             loss = training_step(input, target)
 
-            with LaunchLogger("train", epoch=epoch) as logger:
-                logger.log_minibatch({"Training loss": loss.item()})
+            if dist.rank == 0:
+                # with LaunchLogger("train", epoch=epoch) as logger:
+                # logger.log_minibatch({"Training loss": loss.item()})
+                wandb.log({"Training loss": loss.item()})
 
             if it and it % cfg.training.ckpt_every == 0 and dist.rank == 0:
                 save_checkpoint(f"{cfg.training.result_dir}/ckpt.pt", model, optimizer, epoch=it)
